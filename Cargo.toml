@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
+chrono = "0.4.31"
 getopts = "0.2.21"
 libc = "0.2.149"
 signal-hook = "0.3.17"

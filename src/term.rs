@@ -1,8 +1,9 @@
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     mem::MaybeUninit,
     os::fd::{AsRawFd, RawFd},
-    sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
+    sync::{atomic::AtomicBool, mpsc, Arc, Condvar, Mutex},
     time::Duration,
 };
 
@@ -15,11 +16,9 @@ pub struct Term {
     cleaned_up: bool,
 
     output: Mutex<Box<dyn ForOut>>,
-    tx: mpsc::SyncSender<Event>,
-    rx: Mutex<mpsc::Receiver<Event>>,
     sigterm: Arc<AtomicBool>,
 
-    inner: Mutex<Inner>,
+    inner: Arc<(Mutex<Inner>, Condvar)>,
 }
 
 enum Event {
@@ -31,9 +30,14 @@ enum Event {
 
 struct Inner {
     state: State,
+    input: VecDeque<u8>,
+    eof: bool,
+    interrupted: bool,
+    ctrlc: bool,
     buffer: String,
     prompt: String,
     sigterm_delivered: bool,
+    log: Option<String>,
 }
 
 enum State {
@@ -92,36 +96,70 @@ impl Term {
 
         let _sz = getwinsz(output.as_raw_fd())?;
 
+        let mut inner0 = Arc::new((
+            Mutex::new(Inner {
+                state: State::Rest,
+                buffer: "".into(),
+                prompt: "fillmem> ".into(),
+                sigterm_delivered: false,
+                eof: false,
+                interrupted: false,
+                input: Default::default(),
+                log: None,
+                ctrlc: false,
+            }),
+            Condvar::new(),
+        ));
+
         /*
          * Create a thread to process input from stdin.
          */
-        let (tx0, rx) = mpsc::sync_channel(0);
-        let tx = tx0.clone();
-        std::thread::spawn(move || {
-            let mut br = std::io::BufReader::new(input);
-            let mut buf = [0u8; 1];
+        let inner = Arc::clone(&inner0);
+        std::thread::Builder::new()
+            .name("stdin".into())
+            .spawn(move || {
+                let mut br = std::io::BufReader::new(input);
+                let mut buf = [0u8; 1];
 
-            loop {
-                match br.read(&mut buf) {
-                    Ok(0) => {
-                        tx.send(Event::End).ok();
-                        return;
-                    }
-                    Ok(1) => {
-                        if tx.send(Event::Input(buf[0])).is_err() {
+                loop {
+                    match br.read(&mut buf) {
+                        Ok(0) => {
+                            let mut i = inner.0.lock().unwrap();
+                            i.eof = true;
+                            inner.1.notify_all();
                             return;
                         }
-                    }
-                    Ok(n) => panic!("{} is not the correct number of bytes", n),
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                        if tx.send(Event::Interrupted).is_err() {
-                            return;
+                        Ok(1) => {
+                            let mut i = inner.0.lock().unwrap();
+
+                            if buf[0] == 0x03 {
+                                /*
+                                 * Handle ^C interrupt by dropping the inbound
+                                 * buffer and reporting immediately.
+                                 */
+                                i.ctrlc = true;
+                                i.input.clear();
+                            } else {
+                                i.input.push_back(buf[0]);
+                            }
+
+                            inner.1.notify_all();
                         }
-                    }
-                    _ => return, /* XXX */
-                };
-            }
-        });
+                        Ok(n) => {
+                            panic!("{} is not the correct number of bytes", n)
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::Interrupted =>
+                        {
+                            let mut i = inner.0.lock().unwrap();
+                            i.interrupted = true;
+                            inner.1.notify_all();
+                        }
+                        _ => return, /* XXX */
+                    };
+                }
+            })
+            .unwrap();
 
         /*
          * Put the terminal in raw mode.
@@ -136,35 +174,37 @@ impl Term {
             orig_termios,
             cleaned_up: false,
             output: Mutex::new(output),
-            tx: tx0,
-            rx: Mutex::new(rx),
             sigterm,
-            inner: Mutex::new(Inner {
-                state: State::Rest,
-                buffer: "".into(),
-                prompt: "fillmem> ".into(),
-                sigterm_delivered: false,
-            }),
+            inner: inner0,
         })
     }
 
     pub fn log(&self, msg: &str) -> Result<()> {
-        let i = self.inner.lock().unwrap();
+        let mut i = self.inner.0.lock().unwrap();
 
-        match i.state {
-            State::Rest => {
-                self.emit(msg)?;
-                self.emit("\r\n")?;
-            }
-            State::CleanedUp => {
-                println!("{msg}");
-            }
-            State::Editing => {
-                self.tx.send(Event::Log(msg.to_string()))?;
+        loop {
+            match i.state {
+                State::Rest => {
+                    self.emit(msg)?;
+                    self.emit("\r\n")?;
+                    return Ok(());
+                }
+                State::CleanedUp => {
+                    println!("{msg}");
+                    return Ok(());
+                }
+                State::Editing => {
+                    if i.log.is_some() {
+                        i = self.inner.1.wait(i).unwrap();
+                        continue;
+                    }
+
+                    i.log = Some(msg.to_string());
+                    self.inner.1.notify_all();
+                    return Ok(());
+                }
             }
         }
-
-        Ok(())
     }
 
     fn emit(&self, msg: &str) -> Result<()> {
@@ -175,18 +215,14 @@ impl Term {
         Ok(())
     }
 
-    fn redraw_prompt(&self) -> Result<()> {
-        let (prompt, buf) = {
-            let i = self.inner.lock().unwrap();
-            (i.prompt.to_string(), i.buffer.to_string())
-        };
+    fn redraw_prompt(&self, i: &Inner) -> Result<()> {
         self.emit("\r\x1b[0K")?;
-        self.emit(&prompt)?;
-        self.emit(&buf)?;
+        self.emit(&i.prompt)?;
+        self.emit(&i.buffer)?;
         Ok(())
     }
 
-    fn log_while_editing(&self, msg: &str) -> Result<()> {
+    fn log_while_editing(&self, i: &Inner, msg: &str) -> Result<()> {
         /*
          * To print a log line while we are editing we need to move
          * the cursor back to the front of the line, clear
@@ -196,24 +232,37 @@ impl Term {
         self.emit("\r\x1b[0K")?;
         self.emit(msg)?;
         self.emit("\r\n")?;
-        self.redraw_prompt()
+        self.redraw_prompt(i)
+    }
+
+    pub fn take_ctrlc(&self) -> bool {
+        let mut i = self.inner.0.lock().unwrap();
+        if !i.ctrlc {
+            return false;
+        }
+
+        i.ctrlc = false;
+
+        drop(i);
+        self.log("^C").ok();
+
+        true
     }
 
     pub fn line(&self) -> Result<Line> {
-        let prompt = {
-            let mut i = self.inner.lock().unwrap();
-            match i.state {
-                State::Rest => {
-                    i.buffer.clear();
-                    i.state = State::Editing;
-                    i.prompt.to_string()
-                }
-                State::Editing => bail!("another thread is already editing"),
-                State::CleanedUp => bail!("cleaned up already"),
-            }
-        };
+        let mut i = self.inner.0.lock().unwrap();
 
-        self.emit(&prompt)?;
+        match i.state {
+            State::Rest => {
+                i.buffer.clear();
+                i.state = State::Editing;
+                self.inner.1.notify_all();
+            }
+            State::Editing => bail!("another thread is already editing"),
+            State::CleanedUp => bail!("cleaned up already"),
+        }
+
+        self.emit(&i.prompt)?;
 
         /*
          * Listen for input and process it.
@@ -224,6 +273,7 @@ impl Term {
                 /*
                  * Begin tearing down.
                  */
+                drop(i);
                 self.cleanup();
                 /*
                  * XXX
@@ -231,32 +281,42 @@ impl Term {
                 return Ok(Line::End);
             }
 
-            let b = match self.rx.lock().unwrap().recv_timeout(timeo) {
-                Ok(Event::Input(b)) => b,
-                Ok(Event::Interrupted) => continue,
-                Ok(Event::Log(msg)) => {
-                    self.log_while_editing(&msg)?;
-                    continue;
-                }
-                Ok(Event::End) => {
-                    /*
-                     * XXX eof
-                     */
-                    self.cleanup();
-                    return Ok(Line::End);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    /*
-                     * XXX read thread problem?
-                     */
-                    self.cleanup();
-                    return Ok(Line::End);
-                }
+            if i.ctrlc {
+                /*
+                 * XXX
+                 */
+                i.ctrlc = false;
+                drop(i);
+                self.cleanup();
+                return Ok(Line::End);
+            }
+
+            if i.interrupted {
+                i.interrupted = false;
+                continue;
+            }
+
+            if i.eof {
+                drop(i);
+                self.cleanup();
+                return Ok(Line::End);
+            }
+
+            if let Some(msg) = i.log.take() {
+                self.inner.1.notify_all();
+                self.log_while_editing(&i, &msg)?;
+                continue;
+            }
+
+            let b = if let Some(b) = i.input.pop_front() {
+                self.inner.1.notify_all();
+                b
+            } else {
+                i = self.inner.1.wait_timeout_ms(i, 250).unwrap().0;
+                continue;
             };
 
             if b.is_ascii_graphic() || b == b' ' {
-                let mut i = self.inner.lock().unwrap();
                 if i.buffer.len() < 60 {
                     /*
                      * XXX this will do for now
@@ -268,26 +328,27 @@ impl Term {
                 /*
                  * XXX ^C
                  */
+                drop(i);
                 self.cleanup();
                 return Ok(Line::End);
             } else if b == 0x04 {
                 /*
                  * XXX ^D
                  */
+                drop(i);
                 self.cleanup();
                 return Ok(Line::End);
             } else if b == 0x0d {
                 /*
                  * XXX CR
                  */
-                let mut i = self.inner.lock().unwrap();
                 i.state = State::Rest;
+                self.inner.1.notify_all();
                 let buf = i.buffer.clone();
                 i.buffer.clear();
                 self.emit("\r\n")?;
                 return Ok(Line::Line(buf));
             } else if b == 0x7f {
-                let mut i = self.inner.lock().unwrap();
                 if !i.buffer.is_empty() {
                     let nl = i.buffer.len() - 1;
                     i.buffer.truncate(nl);
@@ -297,10 +358,10 @@ impl Term {
                 /*
                  * XXX ^U
                  */
-                self.inner.lock().unwrap().buffer.clear();
-                self.redraw_prompt()?;
+                i.buffer.clear();
+                self.redraw_prompt(&i)?;
             } else {
-                self.log_while_editing(&format!("unknown b: {b:?}"))?;
+                self.log_while_editing(&i, &format!("unknown b: {b:?}"))?;
 
                 /*
                  * Ring the bell!
@@ -311,13 +372,10 @@ impl Term {
     }
 
     pub fn cleanup(&self) {
-        {
-            let mut i = self.inner.lock().unwrap();
+        let mut i = self.inner.0.lock().unwrap();
 
-            match i.state {
-                State::CleanedUp => return,
-                _ => i.state = State::CleanedUp,
-            }
+        if matches!(i.state, State::CleanedUp) {
+            return;
         }
 
         /*
@@ -328,6 +386,9 @@ impl Term {
         output.flush().ok();
         termios::tcsetattr(output.as_raw_fd(), TCSADRAIN, &self.orig_termios)
             .ok();
+
+        i.state = State::CleanedUp;
+        self.inner.1.notify_all();
     }
 }
 
