@@ -200,7 +200,6 @@ fn main() -> Result<()> {
                             "touched {mb} megabytes in {} msec",
                             dur.as_millis()
                         ))?;
-                        fm.unbusy();
                     }
                     Some(&"grow") => match t.get(1) {
                         Some(megs) => match megs.parse::<usize>() {
@@ -233,21 +232,15 @@ fn main() -> Result<()> {
                                     "grew by {megs} megabytes in {} msec",
                                     dur.as_millis()
                                 ))?;
-                                fm.unbusy();
                             }
-                            Err(e) => {
-                                ed.log(&e.to_string())?;
-                            }
+                            Err(e) => ed.log(&e.to_string())?,
                         },
                         None => ed.log("grow by how much?")?,
                     },
                     Some(other) => {
                         ed.log(&format!("{other:?} not understood"))?;
-                        fm.unbusy();
                     }
-                    None => {
-                        fm.unbusy();
-                    }
+                    None => (),
                 }
             }
             Activity::Line(Line::End) => {
@@ -259,6 +252,8 @@ fn main() -> Result<()> {
                 bail!(e);
             }
         }
+
+        fm.unbusy();
     }
 
     ed.cleanup();
